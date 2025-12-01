@@ -1,0 +1,2251 @@
+---
+title: "Space-Time Prediction - Philadelphia Indego Bike"
+author: "Alex Stauffer"
+date: "2025-12-01"
+output:
+  html_document:
+    theme: yeti
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: hide
+    code_download: true
+    df_print: paged
+---
+
+# Introduction
+
+## The Rebalancing Challenge in Philadelphia
+
+Philadelphia's Indego bike share system faces the same operational challenge as every bike share system: rebalancing bikes to meet anticipated demand. 
+
+Imagine you're an Indego operations manager at 6:00 AM on a Monday morning. You have:
+- 200 stations across Philadelphia
+- Limited trucks and staff for moving bikes
+- 2-3 hours before morning rush hour demand peaks
+- The question: Which stations will run out of bikes by 8:30 AM?
+
+This lab will teach you to build predictive models that forecast bike share demand across space (different stations) and time (different hours) to help solve this operational problem.
+
+# Setup 
+
+## Load Libraries
+
+```{r load_libraries, warning = FALSE, message=FALSE, cache = TRUE}
+# Core tidyverse
+library(tidyverse)
+library(lubridate)
+
+# Spatial data
+library(sf)
+library(tigris)
+
+# Census data
+library(tidycensus)
+
+# Weather data
+library(riem)  # For Philadelphia weather from ASOS stations
+
+# Visualization
+library(viridis)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(grid)
+library(gridExtra)
+library(patchwork)
+library(ggplot2)
+
+
+# here!
+library(here)
+# Get rid of scientific notation. We gotta look good!
+options(scipen = 999)
+```
+
+## Define Themes
+
+```{r themes, cache = FALSE, warning = FALSE}
+plotTheme <- ggplot2::theme(
+  plot.title = ggplot2::element_text(size = 14, face = "bold"),
+  plot.subtitle = ggplot2::element_text(size = 10),
+  plot.caption = ggplot2::element_text(size = 8),
+  axis.text.x = ggplot2::element_text(size = 10, angle = 45, hjust = 1),
+  axis.text.y = ggplot2::element_text(size = 10),
+  axis.title = ggplot2::element_text(size = 11, face = "bold"),
+  panel.background = ggplot2::element_blank(),
+  panel.grid.major = ggplot2::element_line(colour = "#D0D0D0", size = 0.2),
+  panel.grid.minor = ggplot2::element_blank(),
+  axis.ticks = ggplot2::element_blank(),
+  legend.position = "right"
+)
+
+mapTheme <- ggplot2::theme(
+  plot.title = ggplot2::element_text(size = 14, face = "bold"),
+  plot.subtitle = ggplot2::element_text(size = 10),
+  plot.caption = ggplot2::element_text(size = 8),
+  axis.line = ggplot2::element_blank(),
+  axis.text = ggplot2::element_blank(),
+  axis.ticks = ggplot2::element_blank(),
+  axis.title = ggplot2::element_blank(),
+  panel.background = ggplot2::element_blank(),
+  panel.border = ggplot2::element_blank(),
+  panel.grid.major = ggplot2::element_line(colour = 'transparent'),
+  panel.grid.minor = ggplot2::element_blank(),
+  legend.position = "right",
+  plot.margin = ggplot2::margin(1, 1, 1, 1, 'cm'),
+  legend.key.height = grid::unit(1, "cm"),
+  legend.key.width = grid::unit(0.2, "cm")
+)
+
+palette5 <- c("#eff3ff", "#E1DCF5", "#BBADF0", "#6849BA", "#361AA3")
+```
+
+## Set Census API Key
+
+```{r census_key, include=FALSE}
+
+census_api_key("eeb46a4e68d059982c2b048f843063e19bc4c294", overwrite = TRUE, install = TRUE)
+
+```
+
+---
+
+# Data Import & Preparation
+
+## Load Indego Trip Data (Q1 - Q4 2024)
+```{r load-indegos-2024}
+# Read Q1 2025 data
+indegoq1 <- read.csv(here("labs/lab5/data/indego-trips-2024-q1.csv"))
+indegoq2 <- read.csv(here("labs/lab5/data/indego-trips-2024-q2.csv"))
+indegoq3 <- read.csv(here("labs/lab5/data/indego-trips-2024-q3.csv"))
+indegoq4 <- read.csv(here("labs/lab5/data/indego-trips-2024-q4.csv"))
+
+# Look at data
+glimpse(indegoq1)
+```
+
+## Examine the Data Structure
+
+### Quarter 1 (January - March 2024)
+
+```{r explore-q1, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+# Summary statistics table
+summary_stats <- data.frame(
+  Metric = c(
+    "Total trips in Q1 (Jan-March) 2024",
+    "Date range (start)",
+    "Date range (end)",
+    "Unique start stations"
+  ),
+  Value = c(
+    format(nrow(indegoq1), big.mark = ","),
+    as.character(min(mdy_hm(indegoq1$start_time))),
+    as.character(max(mdy_hm(indegoq1$start_time))),
+    length(unique(indegoq1$start_station))
+  )
+)
+
+kable(summary_stats, 
+      caption = "Q1 (Jan - March 2024) Indego Trip Summary",
+      col.names = c("Metric", "Value"),
+      align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Trip route categories
+route_table <- as.data.frame(table(indegoq1$trip_route_category))
+colnames(route_table) <- c("Route Category", "Count")
+route_table$Percentage <- paste0(round(100 * route_table$Count / sum(route_table$Count), 2), "%")
+
+kable(route_table,
+      caption = "Route Categories",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Passholder types
+passholder_table <- as.data.frame(table(indegoq1$passholder_type))
+colnames(passholder_table) <- c("Passholder Type", "Count")
+passholder_table$Percentage <- paste0(round(100 * passholder_table$Count / sum(passholder_table$Count), 2), "%")
+
+kable(passholder_table,
+      caption = "Passholder Type",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Bike types
+bike_table <- as.data.frame(table(indegoq1$bike_type))
+colnames(bike_table) <- c("Bike Type", "Count")
+bike_table$Percentage <- paste0(round(100 * bike_table$Count / sum(bike_table$Count), 1), "%")
+
+kable(bike_table,
+      caption = "Bike Types",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+### Quarter 2 (April - June 2024)
+
+```{r explore-q2, warning = FALSE, message=FALSE, cache = TRUE}
+
+# Summary statistics table
+summary_stats <- data.frame(
+  Metric = c(
+    "Total trips in Q2 2024",
+    "Date range (start)",
+    "Date range (end)",
+    "Unique start stations"
+  ),
+  Value = c(
+    format(nrow(indegoq2), big.mark = ","),
+    as.character(min(mdy_hm(indegoq2$start_time))),
+    as.character(max(mdy_hm(indegoq2$start_time))),
+    length(unique(indegoq2$start_station))
+  )
+)
+
+kable(summary_stats, 
+      caption = "Q2 2024 Indego Trip Summary",
+      col.names = c("Metric", "Value"),
+      align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Trip route categories
+route_table <- as.data.frame(table(indegoq2$trip_route_category))
+colnames(route_table) <- c("Trip Route Category", "Count")
+route_table$Percentage <- paste0(round(100 * route_table$Count / sum(route_table$Count), 1), "%")
+
+kable(route_table,
+      caption = "Route Categories",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Passholder types (including NAs)
+passholder_table <- as.data.frame(table(indegoq2$passholder_type))
+colnames(passholder_table) <- c("Passholder Type", "Count")
+passholder_table$Percentage <- paste0(round(100 * passholder_table$Count / sum(passholder_table$Count), 2), "%")
+
+kable(passholder_table,
+      caption = "Passholder Type",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Bike types
+bike_table <- as.data.frame(table(indegoq2$bike_type))
+colnames(bike_table) <- c("Bike Type", "Count")
+bike_table$Percentage <- paste0(round(100 * bike_table$Count / sum(bike_table$Count), 1), "%")
+
+kable(bike_table,
+      caption = "Bike Types",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+
+```
+
+### Quarter 3 (July - September 2024)
+```{r explore-q3, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Summary statistics table
+summary_stats <- data.frame(
+  Metric = c(
+    "Total trips in Q3 (Jul-Sept) 2024",
+    "Date range (start)",
+    "Date range (end)",
+    "Unique start stations"
+  ),
+  Value = c(
+    format(nrow(indegoq3), big.mark = ","),
+    as.character(min(mdy_hm(indegoq3$start_time))),
+    as.character(max(mdy_hm(indegoq3$start_time))),
+    length(unique(indegoq3$start_station))
+  )
+)
+
+kable(summary_stats, 
+      caption = "Q3 (Jul - Sept 2024) Indego Trip Summary",
+      col.names = c("Metric", "Value"),
+      align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Trip route categories
+route_table <- as.data.frame(table(indegoq3$trip_route_category))
+colnames(route_table) <- c("Route Category", "Count")
+route_table$Percentage <- paste0(round(100 * route_table$Count / sum(route_table$Count), 2), "%")
+
+kable(route_table,
+      caption = "Route Categories",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Passholder types
+passholder_table <- as.data.frame(table(indegoq3$passholder_type))
+colnames(passholder_table) <- c("Passholder Type", "Count")
+passholder_table$Percentage <- paste0(round(100 * passholder_table$Count / sum(passholder_table$Count), 2), "%")
+
+kable(passholder_table,
+      caption = "Passholder Type",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Bike types
+bike_table <- as.data.frame(table(indegoq3$bike_type))
+colnames(bike_table) <- c("Bike Type", "Count")
+bike_table$Percentage <- paste0(round(100 * bike_table$Count / sum(bike_table$Count), 1), "%")
+
+kable(bike_table,
+      caption = "Bike Types",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+```
+
+### Quarter 4 (October - December 2024)
+
+```{r explore-q4, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+# Summary statistics table
+summary_stats <- data.frame(
+  Metric = c(
+    "Total trips in Q4 (Oct-Dec) 2024",
+    "Date range (start)",
+    "Date range (end)",
+    "Unique start stations"
+  ),
+  Value = c(
+    format(nrow(indegoq4), big.mark = ","),
+    as.character(min(mdy_hm(indegoq4$start_time))),
+    as.character(max(mdy_hm(indegoq4$start_time))),
+    length(unique(indegoq4$start_station))
+  )
+)
+
+kable(summary_stats, 
+      caption = "Q4 (Oct - Dec 2024) Indego Trip Summary",
+      col.names = c("Metric", "Value"),
+      align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Trip route categories
+route_table <- as.data.frame(table(indegoq4$trip_route_category))
+colnames(route_table) <- c("Route Category", "Count")
+route_table$Percentage <- paste0(round(100 * route_table$Count / sum(route_table$Count), 2), "%")
+
+kable(route_table,
+      caption = "Route Categories",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Passholder types
+passholder_table <- as.data.frame(table(indegoq4$passholder_type))
+colnames(passholder_table) <- c("Passholder Type", "Count")
+passholder_table$Percentage <- paste0(round(100 * passholder_table$Count / sum(passholder_table$Count), 2), "%")
+
+kable(passholder_table,
+      caption = "Passholder Type",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Bike types
+bike_table <- as.data.frame(table(indegoq2$bike_type))
+colnames(bike_table) <- c("Bike Type", "Count")
+bike_table$Percentage <- paste0(round(100 * bike_table$Count / sum(bike_table$Count), 1), "%")
+
+kable(bike_table,
+      caption = "Bike Types",
+      format.args = list(big.mark = ","),
+      align = c("l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+```
+
+### Combine all quarters
+
+```{r}
+indego_all <- bind_rows(
+  Q1_2025 = indegoq1,
+  Q2_2024 = indegoq2,
+  Q3_2024 = indegoq3,
+  Q4_2024 = indegoq4,
+  .id = "quarter"
+)
+
+# Check the distribution
+table(indego_all$quarter)
+```
+
+## Create Time Bins
+
+We need to aggregate trips into hourly intervals for our panel data structure.
+
+### Quarter 1
+
+```{r create_time_bins-q1, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+indegoq1 <- indegoq1 %>%
+  mutate(
+    # Parse datetime
+    start_datetime = mdy_hm(start_time),
+    end_datetime = mdy_hm(end_time),
+    
+    # Create hourly bins
+    interval60 = floor_date(start_datetime, unit = "hour"),
+    
+    # Extract time features
+    week = week(interval60),
+    month = month(interval60, label = TRUE),
+    dotw = wday(interval60, label = TRUE),
+    hour = hour(interval60),
+    date = as.Date(interval60),
+    
+    # Create useful indicators
+    weekend = ifelse(dotw %in% c("Sat", "Sun"), 1, 0),
+    rush_hour = ifelse(hour %in% c(7, 8, 9, 16, 17, 18), 1, 0)
+  )
+
+# Look at temporal features
+head(indegoq1 %>% select(start_datetime, interval60, week, dotw, hour, weekend))
+```
+
+### Quarter 2
+
+```{r create_time_bins-q2, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+indegoq2 <- indegoq2 %>%
+  mutate(
+    # Parse datetime
+    start_datetime = mdy_hm(start_time),
+    end_datetime = mdy_hm(end_time),
+    
+    # Create hourly bins
+    interval60 = floor_date(start_datetime, unit = "hour"),
+    
+    # Extract time features
+    week = week(interval60),
+    month = month(interval60, label = TRUE),
+    dotw = wday(interval60, label = TRUE),
+    hour = hour(interval60),
+    date = as.Date(interval60),
+    
+    # Create useful indicators
+    weekend = ifelse(dotw %in% c("Sat", "Sun"), 1, 0),
+    rush_hour = ifelse(hour %in% c(7, 8, 9, 16, 17, 18), 1, 0)
+  )
+
+# Look at temporal features
+head(indegoq2 %>% select(start_datetime, interval60, week, dotw, hour, weekend))
+```
+
+### Quarter 3
+```{r create_time_bins-q3, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+indegoq3 <- indegoq3 %>%
+  mutate(
+    # Parse datetime
+    start_datetime = mdy_hm(start_time),
+    end_datetime = mdy_hm(end_time),
+    
+    # Create hourly bins
+    interval60 = floor_date(start_datetime, unit = "hour"),
+    
+    # Extract time features
+    week = week(interval60),
+    month = month(interval60, label = TRUE),
+    dotw = wday(interval60, label = TRUE),
+    hour = hour(interval60),
+    date = as.Date(interval60),
+    
+    # Create useful indicators
+    weekend = ifelse(dotw %in% c("Sat", "Sun"), 1, 0),
+    rush_hour = ifelse(hour %in% c(7, 8, 9, 16, 17, 18), 1, 0)
+  )
+
+# Look at temporal features
+head(indegoq3 %>% select(start_datetime, interval60, week, dotw, hour, weekend))
+```
+
+### Quarter 4
+
+```{r create_time_bins-q4, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+indegoq4 <- indegoq4 %>%
+  mutate(
+    # Parse datetime
+    start_datetime = mdy_hm(start_time),
+    end_datetime = mdy_hm(end_time),
+    
+    # Create hourly bins
+    interval60 = floor_date(start_datetime, unit = "hour"),
+    
+    # Extract time features
+    week = week(interval60),
+    month = month(interval60, label = TRUE),
+    dotw = wday(interval60, label = TRUE),
+    hour = hour(interval60),
+    date = as.Date(interval60),
+    
+    # Create useful indicators
+    weekend = ifelse(dotw %in% c("Sat", "Sun"), 1, 0),
+    rush_hour = ifelse(hour %in% c(7, 8, 9, 16, 17, 18), 1, 0)
+  )
+
+# Look at temporal features
+head(indegoq4 %>% select(start_datetime, interval60, week, dotw, hour, weekend))
+```
+---
+
+# Part 1: Why I Chose Full Year 2024
+
+## Data Selection Rationale
+
+I selected all four quarters of 2024 rather than a single quarter for a few reasons. First, combining all quarters allows for a larger training dataset which can help minimize the risk of overfitting. Second, Philadelphia experiences very seasonal weather, which in turn affects bike share ridership and demand. In the winter months (Q1 and Q4), low ridership can be attributed to cold temperatures and inclement weather, whereas the spring and summer (Q2 and Q3) see most of the demand. By including the full year, the model learns these seasonal patterns and can generalize better. 
+
+Comparing across all quarters reveals clear temporal differences that are explored in the "Trips Over Time" and "Hourly Patterns" sections below. 
+
+---
+
+# Exploratory Analysis
+
+## Trips Over Time
+```{r trips_over_time, echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+
+# Daily trip counts
+daily1 <- indegoq1 %>%
+  group_by(date) %>%
+  summarize(trips = n())
+daily2 <- indegoq2 %>%
+  group_by(date) %>%
+  summarize(trips = n())
+daily3 <- indegoq3 %>%
+  group_by(date) %>%
+  summarize(trips = n())
+daily4 <- indegoq4 %>%
+  group_by(date) %>%
+  summarize(trips = n())
+
+# Construct plot
+q1 <- ggplot(daily1, aes(x = date, y = trips)) +
+  geom_line(color = "#3182bd", linewidth = 1) +
+  geom_smooth(se = FALSE, color = "#CC2810", linetype = "dashed") +
+  labs(
+    title = "Q1 2024",
+    subtitle = "Winter patterns",
+    x = "Date",
+    y = "Daily Trips"
+  ) +
+  plotTheme
+
+q2 <- ggplot(daily2, aes(x = date, y = trips)) +
+  geom_line(color = "#31a354", linewidth = 1) +
+  geom_smooth(se = FALSE, color = "#CC2810", linetype = "dashed") +
+  labs(
+    title = "Q2 2024",
+    subtitle = "Spring patterns",
+    x = "Date",
+    y = "Daily Trips"
+  ) +
+  plotTheme
+
+q3 <- ggplot(daily3, aes(x = date, y = trips)) +
+  geom_line(color = "darkorange", linewidth = 1) +
+  geom_smooth(se = FALSE, color = "#CC2810", linetype = "dashed") +
+  labs(
+    title = "Q3 2024",
+    subtitle = "Summer patterns",
+    x = "Date",
+    y = "Daily Trips"
+  ) +
+  plotTheme
+
+q4 <- ggplot(daily4, aes(x = date, y = trips)) +
+  geom_line(color = "#756bb1", linewidth = 1) +
+  geom_smooth(se = FALSE, color = "#CC2810", linetype = "dashed") +
+  labs(
+    title = "Q4 2024",
+    subtitle = "Fall patterns",
+    x = "Date",
+    y = "Daily Trips"
+  ) +
+  plotTheme
+
+
+# 2x2 grid (default)
+(q1 | q2) / (q3 | q4) + 
+  plot_annotation(
+    title = "Indego Daily Ridership - 2024",
+    caption = "Source: Indego bike share"
+  )
+
+```
+
+The drastic dip in early October that shoots from 3000 trips to almost 5000 is suspicious. I tried looking up notable events that occurred in Philadelphia last fall, and I couldn't find much information. Also the spike in ridership in Q1 March 2024 could be due to a number of things, oddly warm weather, SEPTA safety issues, and more. 
+
+## Combining all quarters into one variable
+This code chunk combines all quarters into one variable for easier synthesis once we start looking at the regressions and temporal patterns.
+```{r recombine-processed-quarters, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+
+indego_all <- bind_rows(
+  Q1_2024 = indegoq1,  # Now these have interval60, week, month, hour, etc.
+  Q2_2024 = indegoq2,
+  Q3_2024 = indegoq3,
+  Q4_2024 = indegoq4,
+  .id = "quarter"
+)
+
+# Verify time features are present
+cat("Total trips in processed indego_all:", format(nrow(indego_all), big.mark = ","), "\n")
+cat("Time features present:", all(c("interval60", "week", "month", "hour", "dotw") %in% names(indego_all)), "\n")
+
+# Check distribution by quarter
+table(indego_all$quarter)
+```
+
+
+## Hourly Patterns
+In this code chunk I took each quarter, assigned it to a variable, then assigned that variable to a plotting variable, then lined them up for display below.
+
+```{r hourly-patterns,  echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+
+# Average trips by hour and day type (x4)
+hourly1 <- indegoq1 %>%
+  group_by(hour, weekend) %>%
+  summarize(avg_trips = n() / n_distinct(date), .groups = "drop") %>%
+  mutate(day_type = ifelse(weekend == 1, "Weekend", "Weekday"))
+
+hourly2 <- indegoq2 %>%
+  group_by(hour, weekend) %>%
+  summarize(avg_trips = n() / n_distinct(date), .groups = "drop") %>%
+  mutate(day_type = ifelse(weekend == 1, "Weekend", "Weekday"))
+
+hourly3 <- indegoq3 %>%
+  group_by(hour, weekend) %>%
+  summarize(avg_trips = n() / n_distinct(date), .groups = "drop") %>%
+  mutate(day_type = ifelse(weekend == 1, "Weekend", "Weekday"))
+
+hourly4 <- indegoq4 %>%
+  group_by(hour, weekend) %>%
+  summarize(avg_trips = n() / n_distinct(date), .groups = "drop") %>%
+  mutate(day_type = ifelse(weekend == 1, "Weekend", "Weekday"))
+
+# Simplified plots - shorter titles, remove individual subtitles
+h1 <- ggplot(hourly1, aes(x = hour, y = avg_trips, color = day_type)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = c("Weekday" = "#08519c", "Weekend" = "#6baed6")) +
+  labs(
+    title = "Q1 2024 (Winter)",
+    x = NULL,  # Remove x-axis label from top plots
+    y = "Avg Trips/Hour",
+    color = "Day Type"
+  ) +
+  plotTheme +
+  theme(legend.position = "none")  # Remove legend from individual plots
+
+h2 <- ggplot(hourly2, aes(x = hour, y = avg_trips, color = day_type)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = c("Weekday" = "#08519c", "Weekend" = "#6baed6")) +
+  labs(
+    title = "Q2 2024 (Spring)",
+    x = NULL,
+    y = "Avg Trips/Hour",
+    color = "Day Type"
+  ) +
+  plotTheme +
+  theme(legend.position = "none")
+
+h3 <- ggplot(hourly3, aes(x = hour, y = avg_trips, color = day_type)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = c("Weekday" = "#08519c", "Weekend" = "#6baed6")) +
+  labs(
+    title = "Q3 2024 (Summer)",
+    x = "Hour of Day",
+    y = "Avg Trips/Hour",
+    color = "Day Type"
+  ) +
+  plotTheme +
+  theme(legend.position = "none")
+
+h4 <- ggplot(hourly4, aes(x = hour, y = avg_trips, color = day_type)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = c("Weekday" = "#08519c", "Weekend" = "#6baed6")) +
+  labs(
+    title = "Q4 2024 (Fall)",
+    x = "Hour of Day",
+    y = "Avg Trips/Hour",
+    color = "Day Type"
+  ) +
+  plotTheme
+
+# 2x2 grid with ONE shared legend
+(h1 | h2) / (h3 | h4) + 
+  plot_layout(guides = "collect") +  # Collect legends into one
+  plot_annotation(
+    title = "Average Hourly Ridership Patterns by Quarter",
+    subtitle = "Clear commute patterns on weekdays across all seasons",
+    caption = "Source: Indego bike share"
+  ) &
+  theme(legend.position = "bottom")  # Put legend at bottom
+```
+
+ 
+During typical morning and evening rush hour commute times, there is peak Indego ridership almost consistently across all four quarters at what is assuming to be around 7/8 AM and 5/6 PM. For the weekends, there is more of a gradual increase in ridership as the day progresses, then casually falls off as the evening progresses. 
+
+## Top Stations
+
+The chunk below ranks each station based on the station that has the most starts/deployments from. 
+
+```{r top_stations,  echo = FALSE, warning = FALSE, message=FALSE, cache = TRUE}
+
+# Function to create station summary table
+create_station_summary <- function(data, quarter_name) {
+  station_summary <- data %>%
+    group_by(start_station) %>%
+    summarize(
+      total_trips = n(),
+      avg_daily = n() / n_distinct(date),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(total_trips)) %>%
+    head(10) %>%
+    mutate(
+      rank = row_number(),
+      total_trips = format(total_trips, big.mark = ","),
+      avg_daily = round(avg_daily, 1)
+    ) %>%
+    dplyr::select(rank, start_station, total_trips, avg_daily)
+  
+  kable(station_summary,
+        caption = paste("Top 10 Stations -", quarter_name),
+        col.names = c("Rank", "Station", "Total Trips", "Avg Daily"),
+        align = c("c", "l", "r", "r")) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "condensed"),
+      full_width = FALSE,
+      font_size = 12
+    ) %>%
+    column_spec(1, bold = TRUE, width = "0.5in") %>%
+    column_spec(2, width = "3in") %>%
+    column_spec(3:4, width = "0.8in")
+}
+
+# Create tables for each quarter
+create_station_summary(indegoq1, "Q1 2024")
+create_station_summary(indegoq2, "Q2 2024")
+create_station_summary(indegoq3, "Q3 2024")
+create_station_summary(indegoq4, "Q4 2024")
+```
+
+Station #3010 in Q1 2024 has the most origin trips at 40.9 average trips per day. Station #3010 continues the trend of being the highest starting point of travel in all quarters of 2024. 
+
+---
+
+# Get Philadelphia Spatial Context
+
+## Load Philadelphia Census Data
+
+We'll get census tract data to add demographic context to our stations.
+
+```{r load_census, echo = FALSE, warning = FALSE, message = FALSE}
+# Get Philadelphia census tracts
+philly_census <- get_acs(
+  geography = "tract",
+  variables = c(
+    "B01003_001",  # Total population
+    "B19013_001",  # Median household income
+    "B08301_001",  # Total commuters
+    "B08301_010",  # Commute by transit
+    "B02001_002",  # White alone
+    "B25077_001"   # Median home value
+  ),
+  state = "PA",
+  county = "Philadelphia",
+  year = 2022,
+  geometry = TRUE,
+  output = "wide"
+) %>%
+  rename(
+    Total_Pop = B01003_001E,
+    Med_Inc = B19013_001E,
+    Total_Commuters = B08301_001E,
+    Transit_Commuters = B08301_010E,
+    White_Pop = B02001_002E,
+    Med_Home_Value = B25077_001E
+  ) %>%
+  mutate(
+    Percent_Taking_Transit = (Transit_Commuters / Total_Commuters) * 100,
+    Percent_White = (White_Pop / Total_Pop) * 100
+  ) %>%
+  st_transform(crs = 4326)  # WGS84 for lat/lon matching
+
+# Check the data
+glimpse(philly_census)
+```
+
+## Map Philadelphia Context, Median Household Income
+
+```{r map_philly, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE }
+
+
+# Create station location data
+stations_q1_clean <- indegoq1 %>%
+  group_by(start_station, start_lon, start_lat) %>%
+  summarize(trips = n(), .groups = "drop")
+
+cat("Removed", nrow(stations_q1_clean) - nrow(stations_q1_clean), "stations with missing coordinates\n")
+
+stations_q2 <- indegoq2 %>%
+  group_by(start_station, start_lon, start_lat) %>%
+  summarize(trips = n(), .groups = "drop")
+
+stations_q3 <- indegoq3 %>%
+  group_by(start_station, start_lon, start_lat) %>%
+  summarize(trips = n(), .groups = "drop")
+
+stations_q4 <- indegoq4 %>%
+  group_by(start_station, start_lon, start_lat) %>%
+  summarize(trips = n(), .groups = "drop")
+
+# Q1 Map 
+mhhinc1 <- ggplot() +
+  geom_sf(data = philly_census, aes(fill = Med_Inc), color = NA) +
+  scale_fill_viridis(
+    option = "viridis",
+    name = "Median Income",
+    labels = scales::label_dollar(scale = 1/1000, suffix = "K")
+  ) +
+  labs(title = "Q1 2024") +
+  geom_point(
+    data = stations_q1_clean,
+    aes(x = start_lon, y = start_lat, size = trips),
+    color = "#CC2810", alpha = 0.1
+  ) +
+  scale_size_continuous(range = c(1, 4), guide = "none") +
+  coord_sf(xlim = c(-75.28, -74.96), ylim = c(39.87, 40.14), expand = FALSE) +  # FIX: Force proper extent
+  mapTheme +
+  theme(legend.position = "none")
+
+# Q2 Map
+mhhinc2 <- ggplot() +
+  geom_sf(data = philly_census, aes(fill = Med_Inc), color = NA) +
+  scale_fill_viridis(
+    option = "viridis",
+    name = "Median Income",
+    labels = scales::label_dollar(scale = 1/1000, suffix = "K")
+  ) +
+  labs(title = "Q2 2024") +
+  geom_point(
+    data = stations_q2,
+    aes(x = start_lon, y = start_lat, size = trips),
+    color = "#CC2810", alpha = 0.1
+  ) +
+  scale_size_continuous(range = c(1, 4), guide = "none") +
+  mapTheme +
+  theme(legend.position = "none")
+
+# Q3 Map
+mhhinc3 <- ggplot() +
+  geom_sf(data = philly_census, aes(fill = Med_Inc), color = NA) +
+  scale_fill_viridis(
+    option = "viridis",
+    name = "Median Income",
+    labels = scales::label_dollar(scale = 1/1000, suffix = "K")
+  ) +
+  labs(title = "Q3 2024") +
+  geom_point(
+    data = stations_q3,
+    aes(x = start_lon, y = start_lat, size = trips),
+    color = "#CC2810", alpha = 0.1
+  ) +
+  scale_size_continuous(range = c(1, 4), guide = "none") +
+  mapTheme +
+  theme(legend.position = "none")
+
+# Q4 Map
+mhhinc4 <- ggplot() +
+  geom_sf(data = philly_census, aes(fill = Med_Inc), color = NA) +
+  scale_fill_viridis(
+    option = "viridis",
+    name = "Median Income",
+    labels = scales::label_dollar(scale = 1/1000, suffix = "K")
+  ) +
+  labs(title = "Q4 2024") +
+  geom_point(
+    data = stations_q4,
+    aes(x = start_lon, y = start_lat, size = trips),
+    color = "#CC2810", alpha = 0.1
+  ) +
+  scale_size_continuous(range = c(1, 4), guide = "none") +
+  mapTheme
+
+
+mhhinc1 + mhhinc2 + mhhinc3 + mhhinc4 +   # <-- ADD ALL FOUR!
+  plot_layout(guides = "collect", nrow = 1) +
+  plot_annotation(
+    title = "Indego Station Activity by Quarter: 2024",
+    subtitle = "Red points show station locations sized by trip volume",
+    caption = "Source: Indego bike share, US Census ACS 2022"
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.key.width = unit(3, "cm"),
+    legend.key.height = unit(0.3, "cm"),
+    legend.box.margin = margin(t = 10)
+  )
+
+```
+
+A quick visualization shows there is not much differentiation between the quarters in terms of trip volume at the city-scale.
+
+## Join Census Data to Stations
+
+We'll spatially join census characteristics to each bike station.
+
+```{r census-data, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Create sf object for stations from COMBINED data
+stations_sf <- indego_all %>%
+  distinct(start_station, start_lat, start_lon) %>%
+  filter(!is.na(start_lat), !is.na(start_lon)) %>%
+  st_as_sf(coords = c("start_lon", "start_lat"), crs = 4326)
+
+# Spatial join to get census tract for each station
+stations_census <- st_join(stations_sf, philly_census, left = TRUE) %>%
+  st_drop_geometry()
+
+# Look at the result - investigate whether all of the stations joined to census data
+stations_for_map <- indego_all %>%
+  distinct(start_station, start_lat, start_lon) %>%
+  filter(!is.na(start_lat), !is.na(start_lon)) %>%
+  left_join(
+    stations_census %>% dplyr::select(start_station, Med_Inc),
+    by = "start_station"
+  ) %>%
+  mutate(has_census = !is.na(Med_Inc))
+
+# Add back to trip data
+indego_all_census <- indego_all %>%
+  left_join(
+    stations_census %>% 
+      dplyr::select(start_station, Med_Inc, Percent_Taking_Transit, 
+             Percent_White, Total_Pop),
+    by = "start_station"
+  )
+
+# Prepare data for visualization
+stations_for_map <- indego_all %>%
+  distinct(start_station, start_lat, start_lon) %>%
+  filter(!is.na(start_lat), !is.na(start_lon)) %>%
+  left_join(
+    stations_census %>% dplyr::select(start_station, Med_Inc),
+    by = "start_station"
+  ) %>%
+  mutate(has_census = !is.na(Med_Inc))
+
+# Create the map showing problem stations
+ggplot() +
+  geom_sf(data = philly_census, aes(fill = Med_Inc), color = "white", size = 0.1) +
+  scale_fill_viridis(
+    option = "viridis",
+    name = "Median\nIncome",
+    labels = scales::dollar,
+    na.value = "grey90"
+  ) +
+  # Stations with census data (small grey dots)
+  geom_point(
+    data = stations_for_map %>% filter(has_census),
+    aes(x = start_lon, y = start_lat),
+    color = "grey30", size = 1, alpha = 0.6
+  ) +
+  # Stations WITHOUT census data (red X marks the spot)
+  geom_point(
+    data = stations_for_map %>% filter(!has_census),
+    aes(x = start_lon, y = start_lat),
+    color = "red", size = 1, shape = 4, stroke = 1.5
+  ) +
+  labs(
+    title = "Philadelphia Median Household Income by Census Tract",
+    subtitle = "Indego stations shown (RED = no census data match)",
+    caption = "Red X marks indicate stations that didn't join to census tracts"
+  ) +
+  mapTheme
+```
+
+Unsure what the deal is with this outlier, as our earlier cleaning should have done away with it.
+
+```{r deal-with-missing-data, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Dealing with missing data
+# Identify which stations to keep (only residential neighborhoods)
+valid_stations <- stations_census %>%
+  filter(!is.na(Med_Inc)) %>%
+  pull(start_station)
+
+# Filter trip data to valid stations only
+indego_all_census <- indego_all %>%
+  filter(start_station %in% valid_stations) %>%
+  left_join(
+    stations_census %>% 
+      dplyr::select(start_station, Med_Inc, Percent_Taking_Transit, 
+             Percent_White, Total_Pop),
+    by = "start_station"
+  )
+
+# Summary
+cat("Total trips before filtering:", format(nrow(indego_all), big.mark = ","), "\n")
+cat("Trips at residential stations:", format(nrow(indego_all_census), big.mark = ","), "\n")
+cat("Trips removed:", format(nrow(indego_all) - nrow(indego_all_census), big.mark = ","), "\n")
+```
+
+# Get Weather Data
+
+Weather significantly affects bike share demand! We need to get weather data covering all four quarters of 2024 plus Q1 2025.
+
+```{r get_weather,echo=TRUE, warning = FALSE, message = FALSE, cache = TRUE}
+
+# Get weather from Philadelphia International Airport (KPHL)
+# Covering full year: Q1 2024 through Q4 2024
+
+# Query each quarter separately
+weather_q1 <- riem_measures(station = "PHL", 
+                            date_start = "2024-01-01", 
+                            date_end = "2024-03-31") #Quarter 1 '24
+
+weather_q2 <- riem_measures(station = "PHL", 
+                            date_start = "2024-04-01", 
+                            date_end = "2024-06-30") # Quarter 2 '24
+
+weather_q3 <- riem_measures(station = "PHL", 
+                            date_start = "2024-07-01", 
+                            date_end = "2024-09-30") # Quarter 3 '24
+
+weather_q4 <- riem_measures(station = "PHL", 
+                            date_start = "2024-10-01", 
+                            date_end = "2024-12-31") # Quarter 4 '24 
+
+# Combine them
+weather_2024 <- bind_rows(weather_q1, weather_q2, weather_q3, weather_q4)
+
+# Process weather data
+weather_processed <- weather_2024 %>%
+  mutate(
+    interval60 = floor_date(valid, unit = "hour"),
+    Temperature = tmpf,  # Temperature in Fahrenheit
+    Precipitation = ifelse(is.na(p01i), 0, p01i),  # Hourly precip in inches
+    Wind_Speed = sknt  # Wind speed in knots
+  ) %>%
+  dplyr::select(interval60, Temperature, Precipitation, Wind_Speed) %>%
+  distinct()%>%
+  arrange(interval60)
+
+# Check for missing hours and interpolate if needed
+weather_complete <- weather_processed %>%
+  complete(interval60 = seq(min(interval60), max(interval60), by = "hour")) %>%
+  fill(Temperature, Precipitation, Wind_Speed, .direction = "down")
+
+# Summary statistics
+cat("Weather data coverage:\n")
+cat("Start:", as.character(min(weather_complete$interval60)), "\n")
+cat("End:", as.character(max(weather_complete$interval60)), "\n")
+cat("Total hours:", nrow(weather_complete), "\n\n")
+
+summary(weather_complete %>% dplyr::select(Temperature, Precipitation, Wind_Speed))
+```
+
+## Visualize Weather Patterns
+
+```{r visualize_weather, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Temperature patterns by quarter
+weather_complete %>%
+  mutate(
+    quarter = paste0("Q", quarter(interval60), " 2024")
+  ) %>%  
+  ggplot(aes(x = interval60, y = Temperature, color = quarter)) +
+  geom_line(alpha = 0.6) +
+  geom_smooth(se = FALSE, linewidth = 1.2) +
+  scale_color_viridis_d(option = "plasma") +
+  labs(
+    title = "Philadelphia Temperature Patterns Across All Quarters",
+    subtitle = "2024 Seasonal Temperature Variation",
+    x = "Date",
+    y = "Temperature (°F)",
+    color = "Quarter"
+  ) +
+  plotTheme +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# Create Space-Time Panel
+
+## Aggregate Trips to Station-Hour Level
+
+```{r aggregate_trips, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Count trips by station-hour
+trips_panel <- indego_all_census %>%
+  group_by(interval60, start_station, start_lat, start_lon,
+           Med_Inc, Percent_Taking_Transit, Percent_White, Total_Pop) %>%
+  summarize(Trip_Count = n()) %>%
+  ungroup()
+
+
+# Summary statistics
+cat("Trips by station-hour:\n")
+cat("How many station-hour observations?:", nrow(trips_panel), "\n")
+cat("How many unique stations?:", length(unique(trips_panel$start_station)) , "\n")
+cat("How many unique hours?:", length(unique(trips_panel$interval60)), "\n\n")
+```
+
+## Create Complete Panel Structure
+
+Not every station has trips every hour. We need a **complete panel** where every station-hour combination exists (even if Trip_Count = 0).
+
+```{r complete_panel, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Calculate expected panel size
+n_stations <- length(unique(trips_panel$start_station))
+n_hours <- length(unique(trips_panel$interval60))
+expected_rows <- n_stations * n_hours
+
+cat("Expected panel rows:", format(expected_rows, big.mark = ","), "\n")
+cat("Current rows:", format(nrow(trips_panel), big.mark = ","), "\n")
+cat("Missing rows:", format(expected_rows - nrow(trips_panel), big.mark = ","), "\n")
+
+# Create complete panel
+# Create complete panel
+study_panel <- expand.grid(
+  interval60 = unique(trips_panel$interval60),
+  start_station = unique(trips_panel$start_station)
+) %>%
+  left_join(trips_panel, by = c("interval60", "start_station")) %>%
+  mutate(
+    Trip_Count = replace_na(Trip_Count, 0),
+
+    # extract month from interval60 (assuming POSIXct)
+    month = lubridate::month(interval60, label = TRUE, abbr = TRUE),
+
+    # force ALL 12 months so no new levels occur in testing
+    month = factor(month, levels = month.abb)
+  )
+
+# Fill in station attributes (same for all hours)
+station_attributes <- trips_panel %>%
+  group_by(start_station) %>%
+  summarize(
+    start_lat = first(start_lat),
+    start_lon = first(start_lon),
+    Med_Inc = first(Med_Inc),
+    Percent_Taking_Transit = first(Percent_Taking_Transit),
+    Percent_White = first(Percent_White),
+    Total_Pop = first(Total_Pop)
+  )
+
+study_panel <- study_panel %>%
+  left_join(station_attributes, by = "start_station")
+
+cat("Complete panel rows:", format(nrow(study_panel), big.mark = ","), "\n")
+
+```
+
+## Add Time Features
+
+```{r add_time_features, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+study_panel <- study_panel %>%
+  mutate(
+    week = week(interval60),
+    month = month(interval60, label = TRUE),
+    dotw = wday(interval60, label = TRUE),
+    hour = hour(interval60),
+    date = as.Date(interval60),
+    weekend = ifelse(dotw %in% c("Sat", "Sun"), 1, 0),
+    rush_hour = ifelse(hour %in% c(7, 8, 9, 16, 17, 18), 1, 0)
+  )
+```
+
+
+## Join Weather Data
+
+```{r join_weather, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+study_panel <- study_panel %>%
+  left_join(weather_complete, by = "interval60")
+
+# Check for missing values
+summary(study_panel %>% select(Trip_Count, Temperature, Precipitation))
+```
+
+---
+
+# Create Temporal Lag Variables
+
+The key innovation for space-time prediction: **past demand predicts future demand**.
+
+## Why Lags?
+
+If there were 15 bike trips from Station A at 8:00 AM, there will probably be ~15 trips at 9:00 AM. We can use this temporal persistence to improve predictions.
+
+```{r create_lags, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Sort by station and time
+study_panel <- study_panel %>%
+  arrange(start_station, interval60)
+
+# Create lag variables WITHIN each station
+study_panel <- study_panel %>%
+  group_by(start_station) %>%
+  mutate(
+    lag1Hour = lag(Trip_Count, 1),
+    lag2Hours = lag(Trip_Count, 2),
+    lag3Hours = lag(Trip_Count, 3),
+    lag12Hours = lag(Trip_Count, 12),
+    lag1day = lag(Trip_Count, 24)
+  ) %>%
+  ungroup()
+
+# Remove rows with NA lags (first 24 hours for each station)
+study_panel_complete <- study_panel %>%
+  filter(!is.na(lag1day))
+
+cat("Rows after removing NA lags:", format(nrow(study_panel_complete), big.mark = ","), "\n")
+```
+
+## Visualize Lag Correlations
+
+```{r lag_correlations}
+# Find stations with highest trip counts
+top_stations <- study_panel_complete %>%
+  group_by(start_station) %>%
+  summarize(total_trips = sum(Trip_Count)) %>%
+  arrange(desc(total_trips)) %>%
+  head(10)
+
+print(top_stations)
+
+# Pick a high-activity station (use one from the list above)
+example_station <- study_panel_complete %>%
+  filter(start_station == top_stations$start_station[1]) %>%  # Highest activity station
+  head(168)  # One week
+
+# Check if you have data
+cat("Trip count range:", range(example_station$Trip_Count), "\n")
+cat("Mean trips:", mean(example_station$Trip_Count), "\n")
+
+# Now plot
+ggplot(example_station, aes(x = interval60)) +
+  geom_line(aes(y = Trip_Count, color = "Current"), linewidth = 1) +
+  geom_line(aes(y = lag1Hour, color = "1 Hour Ago"), linewidth = 1, alpha = 0.7) +
+  geom_line(aes(y = lag1day, color = "24 Hours Ago"), linewidth = 1, alpha = 0.7) +
+  scale_color_manual(values = c(
+    "Current" = "#08519c",
+    "1 Hour Ago" = "#3182bd",
+    "24 Hours Ago" = "#6baed6"
+  )) +
+  labs(
+    title = "Temporal Lag Patterns at One Station",
+    subtitle = "Past demand predicts future demand",
+    x = "Date-Time",
+    y = "Trip Count",
+    color = "Time Period"
+  ) +
+  plotTheme
+```
+
+---
+
+# Temporal Train/Test Split
+
+**CRITICAL:** We must train on PAST data and test on FUTURE data!
+
+## Why Temporal Validation Matters
+
+In real operations, at 6:00 AM on March 15, we need to predict demand for March 15-31. We have data from Jan 1 - March 14, but NOT from March 15-31 (it hasn't happened yet!).
+
+**Wrong approach:** Train on weeks 10-13, test on weeks 1-9 (predicting past from future!)
+
+**Correct approach:** Train on weeks 1-9, test on weeks 10-13 (predicting future from past)
+
+```{r temporal_split, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Split by week
+# Q1 has weeks 1-13 (Jan-Mar)
+# Train on weeks 1-9 (Jan 1 - early March)
+# Test on weeks 10-13 (rest of March)
+
+# Which stations have trips in BOTH early and late periods?
+early_stations <- study_panel_complete %>%
+  filter(week < 10) %>%
+  filter(Trip_Count > 0) %>%
+  distinct(start_station) %>%
+  pull(start_station)
+
+late_stations <- study_panel_complete %>%
+  filter(week >= 10) %>%
+  filter(Trip_Count > 0) %>%
+  distinct(start_station) %>%
+  pull(start_station)
+
+# Keep only stations that appear in BOTH periods
+common_stations <- intersect(early_stations, late_stations)
+
+
+# Filter panel to only common stations
+study_panel_complete <- study_panel_complete %>%
+  filter(start_station %in% common_stations)
+
+# NOW create train/test split
+train <- study_panel_complete %>%
+  filter(week < 10)
+
+test <- study_panel_complete %>%
+  filter(week >= 10)
+
+cat("Training observations:", format(nrow(train), big.mark = ","), "\n")
+cat("Testing observations:", format(nrow(test), big.mark = ","), "\n")
+cat("Training date range:", min(train$date), "to", max(train$date), "\n")
+cat("Testing date range:", min(test$date), "to", max(test$date), "\n")
+
+
+```
+
+---
+
+# Build Predictive Models
+
+We'll build 5 models with increasing complexity to see what improves predictions.
+
+## Model 1: Baseline (Time + Weather)
+
+```{r model1, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+
+# Create day of week factor with treatment (dummy) coding
+train <- train %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+
+# Set contrasts to treatment coding (dummy variables)
+contrasts(train$dotw_simple) <- contr.treatment(7)
+
+# Now run the model
+model1 <- lm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation,
+  data = train
+)
+
+summary(model1)
+```
+
+The model uses Monday as the baseline. Each coefficient represents the difference 
+in expected trips per station-hour compared to Monday - dow_simple2 = Tuesday..
+
+**Weekday Pattern (Tue-Fri):**
+
+- All weekdays have positive coefficients (0.007 to 0.608)
+- Wednesday has the highest weekday effect (+0.029)
+- Weekdays likely benefit from concentrated commuting patterns
+
+**Weekend Pattern (Sat-Sun):**
+
+- Both weekend days have negative coefficients (-0.118 and -0.094)
+- This means FEWER trips per station-hour than Monday
+
+**Hourly Interpretation**
+
+Hour   Coefficient   Interpretation
+0      (baseline)    0.000 trips/hour (midnight)
+1      -0.028       slightly fewer than midnight
+...
+6      +0.158       morning activity starting
+7      +0.304       morning rush building
+8      +0.484       PEAK morning rush
+9      +0.376       post-rush
+...
+17     +0.608       PEAK evening rush (5 PM!)
+18     +0.444       evening declining
+...
+23     +0.049       late night minimal
+
+
+## Model 2: Add Temporal Lags
+
+```{r model2, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+model2 <- lm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation +
+    lag1Hour + lag3Hours + lag1day,
+  data = train
+)
+
+summary(model2)
+```
+
+```{r compare-models, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Extract R² values
+r2_model1 <- summary(model1)$r.squared
+r2_model2 <- summary(model2)$r.squared
+
+adj_r2_model1 <- summary(model1)$adj.r.squared
+adj_r2_model2 <- summary(model2)$adj.r.squared
+
+# Calculate improvements
+r2_improvement <- r2_model2 - r2_model1
+adj_r2_improvement <- adj_r2_model2 - adj_r2_model1
+
+
+# Create comparison dataframe
+model_comparison <- data.frame(
+  Model = c("Model 1 (No Lags)", "Model 2 (With Lags)", "Improvement"),
+  R_squared = c(r2_model1, r2_model2, r2_improvement),
+  Adj_R_squared = c(adj_r2_model1, adj_r2_model2, adj_r2_improvement),
+  Percent_Variance = c(r2_model1 * 100, r2_model2 * 100, r2_improvement * 100)
+)
+
+print(model_comparison, row.names = FALSE)
+```
+
+Adding temporal lag variables increased the model's explanatory power from approx. 8% to approx. 29% - a 21 percentage point improvement. In model 1, only about 8% of ridership is explained by hour-of-day, day-of-week, temperature, and precipitation. While not spectacular by any means, adding lag-hour-1, lag-hour-3, and lag-hour-day (accounting for data collected one hour ago, three hours ago, and one day ago), the model now predicts about 29% of ridership tendencies.
+
+
+## Model 3: Add Demographics
+
+```{r model3, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+model3 <- lm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation +
+    lag1Hour + lag3Hours + lag1day +
+    Med_Inc.x + Percent_Taking_Transit.y + Percent_White.y,
+  data = train
+)
+
+summary(model3)
+```
+
+## Model 4: Add Station Fixed Effects
+
+```{r model4, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+model4 <- lm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation +
+    lag1Hour + lag3Hours + lag1day +
+    Med_Inc.x + Percent_Taking_Transit.y + Percent_White.y +
+    as.factor(start_station),
+  data = train
+)
+
+# Summary too long with all station dummies, just show key metrics
+cat("Model 4 R-squared:", summary(model4)$r.squared, "\n")
+cat("Model 4 Adj R-squared:", summary(model4)$adj.r.squared, "\n")
+```
+ 
+Station fixed effects capture baseline differences in demand across Indego stations that aren't explained by Census tract demographics, weather, or temporal patterns.
+
+## Model 5: Add Rush Hour Interaction
+
+```{r model5, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+model5 <- lm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation +
+    lag1Hour + lag3Hours + lag1day + rush_hour + 
+    Med_Inc.x + Percent_Taking_Transit.y + Percent_White.y +
+    as.factor(start_station) +
+    rush_hour * weekend,  # Rush hour effects different on weekends
+  data = train
+)
+
+cat("Model 5 R-squared:", summary(model5)$r.squared, "\n")
+cat("Model 5 Adj R-squared:", summary(model5)$adj.r.squared, "\n")
+```
+
+---
+
+# Model Evaluation
+
+## Calculate Predictions and MAE
+
+```{r calculate_mae, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Get predictions on test set
+
+# Create day of week factor with treatment (dummy) coding
+test <- test %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+
+# Set contrasts to treatment coding (dummy variables)
+contrasts(test$dotw_simple) <- contr.treatment(7)
+
+test <- test %>%
+  mutate(
+    pred1 = predict(model1, newdata = test),
+    pred2 = predict(model2, newdata = test),
+    pred3 = predict(model3, newdata = test),
+    pred4 = predict(model4, newdata = test),
+    pred5 = predict(model5, newdata = test)
+  )
+
+# Calculate MAE for each model
+mae_results <- data.frame(
+  Model = c(
+    "1. Time + Weather",
+    "2. + Temporal Lags",
+    "3. + Demographics",
+    "4. + Station FE",
+    "5. + Rush Hour Interaction"
+  ),
+  MAE = c(
+    mean(abs(test$Trip_Count - test$pred1), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred2), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred3), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred4), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred5), na.rm = TRUE)
+  )
+)
+
+kable(mae_results, 
+      digits = 2,
+      caption = "Mean Absolute Error by Model (Test Set)",
+      col.names = c("Model", "MAE (trips)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+## Visualize Model Comparison
+
+```{r compare_models, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE }
+ggplot(mae_results, aes(x = reorder(Model, -MAE), y = MAE)) +
+  geom_col(fill = "#E1DCF5", alpha = 0.8) +
+  geom_text(aes(label = round(MAE, 2)), vjust = -0.5) +
+  labs(
+    title = "Model Performance Comparison",
+    subtitle = "Lower MAE = Better Predictions",
+    x = "Model",
+    y = "Mean Absolute Error (trips)"
+  ) +
+  plotTheme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+The temporal lag variables provided the largest improvement in predictive accuracy. Moving from Model 1 (time + weather only) to Model 2(adding lag1Hour, lag3Hours, lag1Day) reduced the MAE from 0.71 to 0.58, a solid improvement. The temporal lags are meant to capture "if X riders departed from Station #3010, for example, 1 hour ago, then X riders will depart from Station #3010 at the same time in the next hour." Or, stations that were busy one hour ago are likely to remain busy in the next hour. Interestingly, adding demographic variables, station fixed effects, rush hour interactions, and later precipitation forecast, distance to nearest university, as well as station-type clustering feature implementation interactions actually increased the MAE, suggesting that these additions led to overfitting on the training data. 
+
+---
+
+# Space-Time Error Analysis
+
+## Observed vs. Predicted
+
+Let's use our best model (Model 2, temporal lag) for error analysis.
+
+```{r obs_vs_pred}
+test <- test %>%
+  mutate(
+    error = Trip_Count - pred2,
+    abs_error = abs(error),
+    time_of_day = case_when(
+      hour < 7 ~ "Overnight",
+      hour >= 7 & hour < 10 ~ "AM Rush",
+      hour >= 10 & hour < 15 ~ "Mid-Day",
+      hour >= 15 & hour <= 18 ~ "PM Rush",
+      hour > 18 ~ "Evening"
+    )
+  )
+
+# Scatter plot by time and day type
+ggplot(test, aes(x = Trip_Count, y = pred2)) +
+  geom_point(alpha = 0.2, color = "#6849BA") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkgreen") +
+  facet_grid(weekend ~ time_of_day) +
+  labs(
+    title = "Observed vs. Predicted Bike Trips",
+    subtitle = "Model 2 performance by time period",
+    x = "Observed Trips",
+    y = "Predicted Trips",
+    caption = "Red line = perfect predictions; Green line = actual model fit"
+  ) +
+  plotTheme
+```
+
+The observed vs. predicted plots reveal systematic patterns in Model 2's errors. The model performs best during overnight hours, where demand is consistently near zero and predictions tightly cluster along the perfect-prediction line. Performance degrades substantially during peak periods—particularly PM Rush on weekdays—where the green regression line diverges sharply from the red diagonal. The model exhibits a clear "ceiling effect," rarely predicting more than 6-8 trips per station-hour even when actual demand reaches 20+ trips. This systematic underprediction of high-demand observations is operationally concerning: out-of-stock risk is highest precisely when demand spikes, and those are the predictions where accuracy matters most for rebalancing decisions. Weekend predictions (bottom row) show less extreme divergence, likely because weekend demand is lower and more evenly distributed throughout the day.
+
+## Spatial Error Patterns
+
+Are prediction errors clustered in certain parts of Philadelphia?
+
+```{r spatial_errors, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE, fig.width=12, fig.height=6}
+# Calculate station errors
+station_errors <- test %>%
+  filter(!is.na(pred2)) %>%
+  group_by(start_station, start_lat.x, start_lon.y) %>%
+  summarize(
+    MAE = mean(abs(Trip_Count - pred2), na.rm = TRUE),
+    avg_demand = mean(Trip_Count, na.rm = TRUE),
+    total_trips = sum(Trip_Count),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(start_lat.x), !is.na(start_lon.y))
+
+# Map 1: Prediction Errors
+p1 <- ggplot() +
+  geom_sf(data = philly_census, fill = "#f0f0f0", color = "white", linewidth = 0.3) +
+  geom_point(
+    data = station_errors,
+    aes(x = start_lon.y, y = start_lat.x, size = total_trips, color = MAE),
+    alpha = 0.8
+  ) +
+  scale_color_gradientn(
+    colors = rev(palette5),  # Use your palette
+    name = "Mean Absolute\nError (trips)",
+    breaks = seq(0, max(station_errors$MAE, na.rm = TRUE), length.out = 4),
+    labels = function(x) round(x, 2)
+  ) +
+  scale_size_continuous(
+    name = "Total Trips",
+    range = c(2, 8),
+    breaks = c(100, 500, 1000, 2000),
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Model Prediction Errors by Station",
+    subtitle = "Larger points = more trips; Darker = higher error"
+  ) +
+  coord_sf(xlim = c(-75.25, -75.00), ylim = c(39.88, 40.08)) +
+  mapTheme
+
+# Map 2: Average Demand
+p2 <- ggplot() +
+  geom_sf(data = philly_census, fill = "#f0f0f0", color = "white", linewidth = 0.3) +
+  geom_point(
+    data = station_errors,
+    aes(x = start_lon.y, y = start_lat.x, size = total_trips, color = avg_demand),
+    alpha = 0.8
+  ) +
+  scale_color_gradientn(
+    colors = c("#08519c", "#3182bd", "#6baed6", "#bdd7e7", "#eff3ff"),
+    name = "Average\nDemand\n(trips/hour)",
+    breaks = seq(0, max(station_errors$avg_demand, na.rm = TRUE), length.out = 4),
+    labels = function(x) round(x, 2)
+  ) +
+  scale_size_continuous(
+    name = "Total Trips",
+    range = c(2, 8),
+    breaks = c(100, 500, 1000, 2000),
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Average Demand by Station",
+    subtitle = "Darker blue = higher ridership concentration"
+  ) +
+  coord_sf(xlim = c(-75.25, -75.00), ylim = c(39.88, 40.08)) +
+  mapTheme
+
+# Combine with patchwork
+p1 + p2 +
+  plot_annotation(
+    title = "Model 2 Performance: Spatial Distribution of Errors and Demand",
+    subtitle = "Philadelphia Indego Bike Share - 2024",
+    caption = "Source: Indego bike share trip data; Model 2 predictions (temporal lags)",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5),
+      plot.caption = element_text(size = 8)
+    )
+  )
+```
+
+
+The prediction errors show spatial clustering in Center City and University City having high MAE concentrations. This pattern suggests that the model struggles with high-volume stations that experience rapid demand fluctuations. Neighborhoods like East Passyunk, Point Breeze, Queen Village, Market East, and Northern Liberties/Fishtown show areas where demand is less and also more stable. The spatial concentration of errors in the urban core is operationally significant because these are the stations most likely to experience stockouts and where rebalancing decisions are most consequential.  
+
+## Temporal Error Patterns
+
+When are we most wrong?
+
+```{r temporal_errors}
+# MAE by time of day and day type
+temporal_errors <- test %>%
+  group_by(time_of_day, weekend) %>%
+  summarize(
+    MAE = mean(abs_error, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(day_type = ifelse(weekend == 1, "Weekend", "Weekday"))
+
+ggplot(temporal_errors, aes(x = time_of_day, y = MAE, fill = day_type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Weekday" = "#08519c", "Weekend" = "#6baed6")) +
+  labs(
+    title = "Prediction Errors by Time Period",
+    subtitle = "When is the model struggling most?",
+    x = "Time of Day",
+    y = "Mean Absolute Error (trips)",
+    fill = "Day Type"
+  ) +
+  plotTheme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Errors and Demographics
+
+Are prediction errors related to neighborhood characteristics?
+
+```{r errors_demographics}
+# Join demographic data to station errors
+station_errors_demo <- station_errors %>%
+  left_join(
+    station_attributes %>% dplyr::select(start_station, Med_Inc, Percent_Taking_Transit, Percent_White),
+    by = "start_station"
+  ) %>%
+  filter(!is.na(Med_Inc))
+
+# Create plots
+p1 <- ggplot(station_errors_demo, aes(x = Med_Inc, y = MAE)) +
+  geom_point(alpha = 0.5, color = "#E1DCF5") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  scale_x_continuous(labels = scales::dollar) +
+  labs(title = "Errors vs. Median Income", x = "Median Income", y = "MAE") +
+  plotTheme
+
+p2 <- ggplot(station_errors_demo, aes(x = Percent_Taking_Transit, y = MAE)) +
+  geom_point(alpha = 0.5, color = "#E1DCF5") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Errors vs. Transit Usage", x = "Percent Taking Transit", y = "MAE") +
+  plotTheme
+
+p3 <- ggplot(station_errors_demo, aes(x = Percent_White, y = MAE)) +
+  geom_point(alpha = 0.5, color = "#E1DCF5") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Errors vs. Race", x = "Percent White", y = "MAE") +
+  plotTheme
+
+grid.arrange(p1, p2, p3, ncol = 2)
+```
+
+
+The demographic error analysis reveals nuanced patterns in model performance across neighborhoods. Median income shows virtually no relationship with prediction error—the regression line is nearly flat, suggesting the model neither advantages nor disadvantages stations based on neighborhood wealth. Transit usage shows the clearest pattern: stations in areas with higher transit commuter rates have substantially lower MAE (around 0.6) compared to car-dependent areas (MAE exceeding 1.0). This suggests the model performs best in dense, transit-oriented urban core neighborhoods where bike share integrates into predictable multimodal commuting patterns. Perhaps counterintuitively, the percent white relationship shows a slight positive slope—errors are marginally higher in whiter neighborhoods. This likely reflects that whiter areas in Philadelphia (Center City, Rittenhouse) also have higher ridership volumes and greater demand variability, leading to larger absolute errors. From an equity standpoint, these patterns are relatively reassuring: the model does not systematically underserve lower-income neighborhoods or communities of color. However, the strong transit-usage relationship suggests that peripheral, car-dependent neighborhoods—which may already have limited transportation options—receive less accurate predictions, potentially affecting service quality in areas that could most benefit from reliable bike share access.
+---
+# Feature Implementation 
+
+## Feature Selection Rationale
+
+I engineered three new features targeting specific weaknesses in the baseline model:
+
+**1. Recent Rain (Precipitation Lag)**
+The baseline model includes current precipitation, but people don't immediately resume biking when rain stops. Obstacles like wet streets and wet seats influence rider choice. This "hangover effect" motivated creating a binary indicator for whether precipitation occurred in the previous 3 hours. The visualization confirms that ridership remains suppressed even after rain stops.
+
+**2. Distance to Nearest University**
+The spatial error analysis showed elevated errors near University City, suggesting campus-related demand patterns the model wasn't capturing. Universities generate distinctive ridership: class schedules create predictable hourly peaks, academic calendars can shift demand seasonally, and student demographics differ from typical commuters. I calculated distance from each station to the University of Pennsylvania, Drexel University, and Temple University, flagging stations within 0.5 miles as "near university." Hub campuses like Temple University Center City campus and Saint Joesph's Hawk Hill campus in University City are excluded. 
+
+**3. Station Type Clustering**
+Not all stations serve the same purpose. K-means clustering on hourly demand profiles revealed three distinct station types: Commuter Hubs (strong AM/PM peaks), Residential stations (more distributed demand), and Low Activity stations (consistently low ridership). This categorical feature allows the model to learn different demand dynamics for different station types rather than treating all stations identically.
+
+## Feature 1: Precipitation Forecast
+
+```{r precipitation_forecast, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+study_panel_complete <- study_panel_complete %>%
+  arrange(start_station, interval60) %>%
+  group_by(start_station) %>%
+  mutate(
+    # Rolling 3-hour precipitation sum
+    precip_last_3hrs = lag(Precipitation, 1) + lag(Precipitation, 2) + lag(Precipitation, 3),
+    # Binary: any precipitation in last 3 hours?
+    recent_rain = ifelse(precip_last_3hrs > 0, 1, 0),
+    recent_rain = replace_na(recent_rain, 0)
+  ) %>%
+  ungroup()
+
+
+# Add to train/test
+train <- study_panel_complete %>%
+  filter(week < 10, start_station %in% common_stations)
+
+test <- study_panel_complete %>%
+  filter(week >= 10, start_station %in% common_stations)
+
+# Recreate dotw_simple for both
+train <- train %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+contrasts(train$dotw_simple) <- contr.treatment(7)
+
+test <- test %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+contrasts(test$dotw_simple) <- contr.treatment(7)
+
+# Visualize the impact
+train %>%
+  filter(!is.na(recent_rain)) %>%
+  group_by(hour, recent_rain) %>%
+  summarize(avg_trips = mean(Trip_Count), .groups = "drop") %>%
+  ggplot(aes(x = hour, y = avg_trips, color = factor(recent_rain))) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("0" = "#3182bd", "1" = "grey60"),
+    labels = c("No Recent Rain", "Rain in Last 3 Hours"),
+    name = ""
+  ) +
+  labs(
+    title = "Impact of Recent Precipitation on Demand",
+    subtitle = "Ridership remains suppressed even after rain stops",
+    x = "Hour of Day",
+    y = "Average Trips per Station"
+  ) +
+  plotTheme +
+  theme(legend.position = "bottom")
+```
+
+
+---
+
+## Feature 2: Distance to Nearest University
+
+```{r university_distance, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Philadelphia university coordinates
+universities <- data.frame(
+  name = c("Penn", "Drexel", "Temple"),
+  lon = c(-75.1932,  -75.1897,  -75.1492),
+  lat = c(39.9522,   39.9566,   39.9812)
+)%>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# Get unique stations as sf object
+stations_sf_dist <- study_panel_complete %>%
+  distinct(start_station, start_lat.x, start_lon.x) %>%
+  filter(!is.na(start_lat.x), !is.na(start_lon.x)) %>%
+  st_as_sf(coords = c("start_lon.x", "start_lat.x"), crs = 4326)
+
+dist_to_penn <- st_distance(stations_sf_dist, universities[1, ]) / 1609.34  # meters to miles
+dist_to_drexel <- st_distance(stations_sf_dist, universities[2, ]) / 1609.34
+dist_to_temple <- st_distance(stations_sf_dist, universities[3, ]) / 1609.34
+
+# Add distances to dataframe
+station_uni_dist <- stations_sf_dist %>%
+  st_drop_geometry() %>%
+  bind_cols(
+    dist_to_penn = as.numeric(dist_to_penn),
+    dist_to_drexel = as.numeric(dist_to_drexel),
+    dist_to_temple = as.numeric(dist_to_temple)
+  ) %>%
+  mutate(
+    dist_to_nearest_uni = pmin(dist_to_penn, dist_to_drexel, dist_to_temple),
+    near_university = ifelse(dist_to_nearest_uni < 0.5, 1, 0)  # Within 0.5 miles
+  )
+
+# Need to get the coordinates back for mapping
+station_uni_dist <- study_panel_complete %>%
+  distinct(start_station, start_lat.x, start_lon.x) %>%
+  filter(!is.na(start_lat.x), !is.na(start_lon.x)) %>%
+  left_join(station_uni_dist, by = "start_station")
+
+cat("Stations with distance calculated:", nrow(station_uni_dist), "\n\n")
+
+# Join back to datasets
+train <- train %>%
+  left_join(station_uni_dist %>% select(start_station, dist_to_nearest_uni, near_university),
+            by = "start_station")
+test <- test %>%
+  left_join(station_uni_dist %>% select(start_station, dist_to_nearest_uni, near_university),
+            by = "start_station")
+
+# Extract university coordinates for plotting
+uni_coords <- universities %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  bind_cols(name = c("Penn", "Drexel", "Temple"))
+
+
+
+# Map university proximity
+ggplot() +
+  geom_sf(data = philly_census, fill = "#f0f0f0", color = "white", linewidth = 0.3) +
+  # Universities
+  geom_point(
+    data = uni_coords,
+    aes(x = X, y = Y),
+    color = "#E1DCF5", size = 8, shape = 18  # Diamond shape
+  ) +
+  geom_text(
+    data = uni_coords,
+    aes(x = X, y = Y, label = name),
+    vjust = -1.5, size = 3.5, fontface = "bold"
+  ) +
+  # Stations colored by university proximity
+  geom_point(
+    data = station_uni_dist,
+    aes(x = start_lon.x, y = start_lat.x, color = dist_to_nearest_uni, size = near_university),
+    alpha = 0.7
+  ) +
+  scale_color_gradientn(
+    colors = rev(palette5),
+    name = "Distance to\nNearest Uni\n(miles)",
+    limits = c(0, 5)
+  ) +
+  scale_size_continuous(range = c(1.5, 4), guide = "none") +
+  labs(
+    title = "Indego Stations by University Proximity",
+    subtitle = "Larger points = within 0.5 miles of university"
+  ) +
+  coord_sf(xlim = c(-75.25, -75.00), ylim = c(39.88, 40.08)) +
+  mapTheme
+
+
+```
+
+
+```{r university_distance2, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Compare demand near vs far from universities
+train %>%
+  group_by(hour, near_university, dotw) %>%
+  summarize(avg_trips = mean(Trip_Count), .groups = "drop") %>%
+  filter(dotw %in% c("Mon", "Tue", "Wed", "Thu", "Fri")) %>%
+  ggplot(aes(x = hour, y = avg_trips, color = factor(near_university))) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("0" = "grey60", "1" = "#6849BA"),
+    labels = c("Away from Universities", "Near Universities (< 0.5 mi)"),
+    name = ""
+  ) +
+  labs(
+    title = "Ridership Patterns: University vs Non-University Stations",
+    subtitle = "Weekdays only - University stations show distinct peaks",
+    x = "Hour of Day",
+    y = "Average Trips per Station"
+  ) +
+  plotTheme +
+  theme(legend.position = "bottom") 
+
+```
+
+---
+
+## Feature 3: Station-type Clustering
+
+```{r station_clustering, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Create hourly demand profiles for each station
+station_profiles <- train %>%
+  group_by(start_station, hour) %>%
+  summarize(
+    avg_demand = mean(Trip_Count),
+    weekend_demand = mean(Trip_Count[weekend == 1]),
+    weekday_demand = mean(Trip_Count[weekend == 0]),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    id_cols = start_station,
+    names_from = hour,
+    values_from = avg_demand,
+    names_prefix = "hour_"
+  )
+
+# K-means clustering (3 types)
+set.seed(123)
+station_clusters <- station_profiles %>%
+  select(starts_with("hour_")) %>%
+  scale() %>%
+  kmeans(centers = 3, nstart = 25)
+
+# Add cluster labels
+station_profiles$station_type <- station_clusters$cluster
+
+# Interpret clusters
+cluster_summary <- train %>%
+  left_join(
+    station_profiles %>% select(start_station, station_type),
+    by = "start_station"
+  ) %>%
+  group_by(station_type, hour) %>%
+  summarize(avg_demand = mean(Trip_Count), .groups = "drop")
+
+ #Visualize cluster patterns
+ggplot(cluster_summary, aes(x = hour, y = avg_demand, color = factor(station_type))) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(
+    values = c("1" = palette5[5], "2" = palette5[3], "3" = palette5[1]),
+    name = "Station Type",
+    labels = c("Type 1", "Type 2", "Type 3")
+  ) +
+  labs(
+    title = "Station Types Based on Temporal Demand Patterns",
+    subtitle = "K-means clustering reveals distinct usage profiles",
+    x = "Hour of Day",
+    y = "Average Trips per Station"
+  ) +
+  plotTheme +
+  theme(legend.position = "bottom")
+```
+
+```{r station_clustering2, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Label the clusters based on patterns
+station_profiles <- station_profiles %>%
+  mutate(
+    station_type_label = case_when(
+      station_type == 1 ~ "Commuter Hub",      # High AM/PM peaks
+      station_type == 2 ~ "Residential",       # Moderate, spread out
+      station_type == 3 ~ "Low Activity"       # Consistently low
+    )
+  )
+
+# Map station types
+station_map_data <- train %>%
+  distinct(start_station, start_lat.x, start_lon.x) %>%
+  left_join(station_profiles %>% select(start_station, station_type_label),
+            by = "start_station")
+
+ggplot() +
+  geom_sf(data = philly_census, fill = "#f0f0f0", color = "white", linewidth = 0.3) +
+  geom_point(
+    data = station_map_data,
+    aes(x = start_lon.x, y = start_lat.x, color = station_type_label),
+    size = 3, alpha = 0.7
+  ) +
+  scale_color_manual(
+    values = c(
+      "Commuter Hub" = palette5[5],
+      "Residential" = palette5[3],
+      "Low Activity" = palette5[1]
+    ),
+    name = "Station Type"
+  ) +
+  labs(
+    title = "Station Types Across Philadelphia",
+    subtitle = "Clustered by temporal demand patterns"
+  ) +
+  coord_sf(xlim = c(-75.25, -75.00), ylim = c(39.88, 40.08)) +
+  mapTheme
+```
+
+
+---
+
+# Model Improvements
+
+Now we'll test whether our three engineered features actually improve predictions.
+
+## Model 6: Add Engineered Features
+
+We add our three new features to Model 5 (our best OLS model so far):
+
+1. **recent_rain**: Binary indicator if precipitation occurred in the last 3 hours
+2. **near_university**: Binary indicator if station is within 0.5 miles of Penn, Drexel, or Temple
+3. **station_type_label**: Categorical variable from k-means clustering (Commuter Hub, Residential, Low Activity)
+  
+```{r model6_new_features, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Add to train/test
+train <- study_panel_complete %>%
+  filter(week < 10, start_station %in% common_stations)
+
+test <- study_panel_complete %>%
+  filter(week >= 10, start_station %in% common_stations)
+
+# Recreate dotw_simple for both
+train <- train %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+contrasts(train$dotw_simple) <- contr.treatment(7)
+
+test <- test %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+contrasts(test$dotw_simple) <- contr.treatment(7)
+
+# ADD THIS HERE - Re-join university data and station clusters
+train <- train %>%
+  left_join(station_uni_dist %>% dplyr::select(start_station, dist_to_nearest_uni, near_university),
+            by = "start_station") %>%
+  left_join(station_profiles %>% dplyr::select(start_station, station_type_label),
+            by = "start_station")
+
+test <- test %>%
+  left_join(station_uni_dist %>% dplyr::select(start_station, dist_to_nearest_uni, near_university),
+            by = "start_station") %>%
+  left_join(station_profiles %>% dplyr::select(start_station, station_type_label),
+            by = "start_station")
+
+
+
+model6 <- lm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation +
+    lag1Hour + lag3Hours + lag1day + rush_hour + 
+    Med_Inc.x + Percent_Taking_Transit.x + Percent_White.x +
+    as.factor(start_station) +
+    rush_hour * weekend +
+    recent_rain +
+    near_university +
+    station_type_label,
+  data = train
+)
+
+
+
+cat("Model 6 Adj R-squared:", round(summary(model6)$adj.r.squared, 4), "\n")
+
+# Calculate MAE on test set
+test$pred6 <- predict(model6, newdata = test)
+mae_model6 <- mean(abs(test$Trip_Count - test$pred6), na.rm = TRUE)
+cat("Model 6 MAE:", round(mae_model6, 3), "\n")
+
+# Compare to best model (Model 2)
+cat("\nComparison to Model 2 (best baseline):\n")
+cat("Model 2 MAE: 0.577\n")
+cat("Model 6 MAE:", round(mae_model6, 3), "\n")
+cat("Difference:", round(mae_model6 - 0.577, 3), "(positive = worse)\n")
+```
+
+Despite these theoretically-motivated features, Model 6 (OLS with new features) achieved an MAE of 0.832—actually worse than the simple temporal lag model (0.577). This suggests overfitting: the new features may capture patterns present in the training period that don't generalize to the test period.
+
+## Model 7: Poisson 
+```{r model7_poisson, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+# Poisson regression - better for count data
+model7_poisson <- glm(
+  Trip_Count ~ as.factor(hour) + dotw_simple + Temperature + Precipitation +
+    lag1Hour + lag3Hours + lag1day + rush_hour + 
+    Med_Inc.x + Percent_Taking_Transit.y + Percent_White.y +
+    as.factor(start_station) +
+    rush_hour * weekend +
+    recent_rain +
+    near_university +
+    station_type_label,
+  data = train,
+  family = poisson(link = "log")
+)
+
+# Check for overdispersion
+dispersion <- model7_poisson$deviance / model7_poisson$df.residual
+cat("Poisson Dispersion Ratio:", round(dispersion, 2), "\n")
+cat("(Should be ~1; if >> 1, data is overdispersed)\n")
+
+```
+
+The Poisson regression (MAE = 0.824) performed better than Model 6 but still worse than Model 2. The Poisson regression yielded a dispersion ratio of 0.34, indicating the data is underdispersed. Trip counts have less variability than a Poisson distribution would predict. This suggests bike share demand is fairly regular and predictable at the hourly level, likely because strong temporal patterns (commute times, weather effects) constrain the variance.
+
+## Comparison
+```{r final_mae_comparison, echo = TRUE, warning = FALSE, message=FALSE, cache = TRUE}
+test <- test %>%
+  mutate(dotw_simple = factor(dotw, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")))
+
+contrasts(test$dotw_simple) <- contr.treatment(7)
+
+test <- test %>%
+  mutate(
+    pred1 = predict(model1, newdata = test),
+    pred2 = predict(model2, newdata = test),
+    pred3 = predict(model3, newdata = test),
+    pred4 = predict(model4, newdata = test),
+    pred5 = predict(model5, newdata = test),
+    pred6 = predict(model6, newdata = test),
+    pred7_poisson = predict(model7_poisson, newdata = test, type = "response")
+  )
+
+mae_results <- data.frame(
+  Model = c(
+    "1. Time + Weather",
+    "2. + Temporal Lags",
+    "3. + Demographics",
+    "4. + Station FE",
+    "5. + Rush Hour Interaction",
+    "6. + New Features (OLS)",
+    "7. Poisson"
+  ),
+  MAE = c(
+    mean(abs(test$Trip_Count - test$pred1), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred2), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred3), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred4), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred5), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred6), na.rm = TRUE),
+    mean(abs(test$Trip_Count - test$pred7_poisson), na.rm = TRUE)
+  )
+)
+
+kable(mae_results, 
+      digits = 3,
+      caption = "Mean Absolute Error by Model (Test Set)",
+      col.names = c("Model", "MAE (trips)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+Despite the inclusion of new spatial features, the second model highlighting the temporal lags yield the lowest MAE (0.577), making it the best model of the analysis. The high MAE of new feature regressions could be indicative of overfitting.
+
+## Part 4: Critical Reflection 
+
+Let's review the implications of these findings. 
+
+```{r part4_diagnostics, echo = TRUE, warning = FALSE, message=FALSE}
+
+# Make sure pred2 exists for all diagnostics
+test$pred2 <- predict(model2, newdata = test)
+
+
+# What's the distribution of actual trip counts?
+cat("Trip Count Summary:\n")
+summary(test$Trip_Count)
+
+cat("\n\nTrip count distribution:\n")
+table(cut(test$Trip_Count, breaks = c(-1, 0, 2, 5, 10, 15, Inf),
+          labels = c("0", "1-2", "3-5", "6-10", "11-15", "16+")))
+
+# What % of station-hours have 0 trips?
+cat("\n\nPercent of station-hours with 0 trips:", 
+    round(mean(test$Trip_Count == 0) * 100, 1), "%\n")
+
+# Average demand at different station types
+cat("\n\nAverage trips by station type:\n")
+test %>%
+  group_by(station_type_label) %>%
+  summarize(
+    avg_trips = mean(Trip_Count),
+    median_trips = median(Trip_Count),
+    max_trips = max(Trip_Count)
+  ) %>%
+  print()
+
+# Relative error at high vs low demand hours
+cat("\n\nMAE by demand level:\n")
+test %>%
+  mutate(
+    demand_level = case_when(
+      Trip_Count == 0 ~ "Zero trips",
+      Trip_Count <= 2 ~ "Low (1-2)",
+      Trip_Count <= 5 ~ "Medium (3-5)",
+      TRUE ~ "High (6+)"
+    ),
+    pred2 = predict(model2, newdata = cur_data()),  # recalculate inline
+    error = abs(Trip_Count - pred2)
+  ) %>%
+  group_by(demand_level) %>%
+  summarize(
+    n = n(),
+    avg_actual = mean(Trip_Count),
+    MAE = mean(error, na.rm = TRUE),
+    relative_error_pct = mean(error / pmax(Trip_Count, 0.5)) * 100
+  )
+# Error during rush hour vs not
+cat("\n\nMAE by time period:\n")
+test %>%
+  mutate(error = abs(Trip_Count - pred2)) %>%
+  group_by(rush_hour) %>%
+  summarize(
+    avg_trips = mean(Trip_Count),
+    MAE = mean(error)
+  ) %>%
+  print()
+```
+
+**Operational Implications**
+This model achieves a best-case MAE of 0.577 trips per station-hour using only temporal lag features (Model 2). At first glance this seems operationally useful, but context is critical: 68.6% of station-hours have zero trips, and the median is also zero. The mean of just 0.6 trips per station-hour means most predictions are for very low-demand situations. When we examine MAE by demand level, the model performs well for quiet periods (MAE = 0.35 for zero-trip hours) but struggles dramatically during high-demand periods (MAE = 4.97 for stations with 6+ trips). This "ceiling effect" is operationally concerning—the model underpredicts precisely when stockout risk is highest.
+
+For Indego's rebalancing operations, I would recommend deploying this model as a screening tool rather than an automated decision-maker. The model reliably identifies which stations will remain quiet, freeing operations staff to focus attention on the ~31% of station-hours with actual activity. However, for high-volume stations during peak periods, predictions should be treated as lower bounds rather than point estimates. A risk-averse deployment strategy might add a buffer to predictions at Residential stations (which average 1.49 trips/hour—nearly double Commuter Hubs at 0.83) and flag any station predicted above 3 trips as "high priority" for monitoring.
+
+**Equity Considerations**
+The error analysis revealed that prediction errors do not systematically disadvantage lower-income neighborhoods or communities of color—if anything, errors are slightly higher in wealthier, whiter areas due to their higher ridership volumes. The strongest demographic pattern was transit usage: stations in transit-rich areas (60%+ taking transit) had substantially lower MAE than car-dependent areas. This suggests the model works best in the dense urban core where bike share integrates into predictable multimodal commuting.
+
+From an equity standpoint, this pattern raises concerns for peripheral neighborhoods. Areas with lower transit usage—which may already have limited transportation options—receive less accurate predictions, potentially affecting service quality where reliable bike share access could provide the most benefit. To mitigate these risks, I would recommend: (1) establishing minimum service levels for all stations regardless of predicted demand; (2) regularly auditing model performance across demographic groups; (3) applying conservative prediction buffers in underserved areas to avoid systematic under-allocation; and (4) supplementing algorithmic predictions with community input about where bikes are actually needed.
+
+**Model Limitations**
+Several important patterns remain outside this model's predictive capacity. The station type analysis revealed unexpected results: "Low Activity" stations had the highest maximum trips (28), suggesting occasional demand spikes the model cannot anticipate—likely from special events or irregular usage patterns. The model also cannot account for Phillies games, university graduations, SEPTA disruptions, or construction detours that temporarily shift demand.
+
+Perhaps most fundamentally, the model assumes future demand mirrors historical patterns. With 68.6% of observations being zeros, the model is essentially learning "most station-hours are quiet"—which is true but not operationally useful. The real value would come from accurately predicting the 1-2% of station-hours with 6+ trips, but that's exactly where MAE is worst (4.97 trips). With additional time and data, I would prioritize: building separate models for high-volume vs. low-volume stations; incorporating event calendars; testing classification approaches (will this station-hour exceed 5 trips? yes/no) rather than regression; and adding real-time dock availability to identify stations already approaching capacity constraints.
+
+
