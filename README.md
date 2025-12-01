@@ -6,4 +6,4 @@ This work demonstrates practical forecasting for real-world mobility operations,
 
 ## View the Full HTML Report
 
-👉 **[Open Lab 5 HTML Report](https://astauf03.github.io/musa5080---lab5/lab5-again.html)**
+👉 **[Open Lab 5 HTML Report]([https://astauf03.github.io/musa5080---lab5/lab5-again.html](https://astauf03.github.io/musa5080---lab5/))**
